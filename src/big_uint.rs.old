@@ -1,0 +1,421 @@
+use std::{cmp, fmt, slice};
+
+#[derive(Debug)]
+pub enum BigUint {
+    TwoDigit([u64; 2]),
+    MultiDigit(Vec<u64>),
+}
+
+impl Clone for BigUint {
+    fn clone(&self) -> Self {
+        match self.all_digits() {
+            [] => Self::ZERO,
+            &[digit] => Self::new(digit),
+            &[d0, d1] => Self::TwoDigit([d0, d1]),
+            digits => Self::MultiDigit(digits.to_vec()),
+        }
+    }
+    fn clone_from(&mut self, source: &Self) {
+        match self {
+            Self::TwoDigit(_) => *self = source.clone(),
+            Self::MultiDigit(digits) => {
+                digits.clear();
+                digits.extend_from_slice(source.digits());
+            }
+        }
+    }
+}
+
+impl Default for BigUint {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+impl BigUint {
+    pub const ZERO: Self = Self::TwoDigit([0, 0]);
+    pub const ONE: Self = Self::TwoDigit([1, 0]);
+
+    pub const fn new(digit: u64) -> Self {
+        Self::TwoDigit([digit, 0])
+    }
+
+    pub fn is_zero(&self) -> bool {
+        match self {
+            Self::TwoDigit(digits) => matches!(digits, [0, 0]),
+            Self::MultiDigit(digits) => digits.is_empty(),
+        }
+    }
+
+    pub fn is_nonzero(&self) -> bool {
+        !self.is_zero()
+    }
+
+    pub fn with_capacity(capacity: usize, digit: u64) -> Self {
+        if capacity <= 2 {
+            return Self::new(digit);
+        }
+        let mut digits = Vec::with_capacity(capacity);
+        digits.push(digit);
+        Self::MultiDigit(digits)
+    }
+
+    pub fn num_digits(&self) -> usize {
+        match self {
+            Self::TwoDigit([0, 0]) => 0,
+            Self::TwoDigit([_, 0]) => 1,
+            Self::TwoDigit([_, _]) => 2,
+            Self::MultiDigit(digits) => digits.len(),
+        }
+    }
+    pub fn bit_len(&self) -> usize {
+        match self {
+            Self::TwoDigit([d, 0]) => (64 - d.leading_zeros()) as _,
+            Self::TwoDigit([_, d]) => (128 - d.leading_zeros()) as _,
+            Self::MultiDigit(digits) => {
+                let len = digits.len();
+                64 * len - digits[len - 1].leading_zeros() as usize
+            }
+        }
+    }
+
+    pub fn digits(&self) -> &[u64] {
+        let digits = match self {
+            Self::TwoDigit([0, 0]) => &[],
+            Self::TwoDigit([d, 0]) => slice::from_ref(d),
+            Self::TwoDigit(digits) => digits,
+            Self::MultiDigit(digits) => digits,
+        };
+        debug_assert_ne!(digits.last(), Some(&0));
+        digits
+    }
+    pub fn digits_mut(&mut self) -> &mut [u64] {
+        let digits = match self {
+            Self::TwoDigit([0, 0]) => &mut [],
+            Self::TwoDigit([d, 0]) => slice::from_mut(d),
+            Self::TwoDigit(digits) => digits,
+            Self::MultiDigit(digits) => digits,
+        };
+        debug_assert_ne!(digits.last(), Some(&0));
+        digits
+    }
+    pub fn all_digits(&self) -> &[u64] {
+        match self {
+            Self::TwoDigit(digits) => digits,
+            Self::MultiDigit(digits) => digits,
+        }
+    }
+    pub fn all_digits_mut(&mut self) -> &mut [u64] {
+        match self {
+            Self::TwoDigit(digits) => digits,
+            Self::MultiDigit(digits) => digits,
+        }
+    }
+
+    fn zero_extend(&mut self, num_digits: usize) {
+        match self {
+            &mut Self::TwoDigit([d0, d1]) => {
+                if num_digits <= 2 {
+                    return;
+                }
+                let mut digits = vec![0; num_digits];
+                digits[0] = d0;
+                digits[1] = d1;
+                *self = Self::MultiDigit(digits);
+            }
+            Self::MultiDigit(digits) => {
+                if digits.len() < num_digits {
+                    digits.resize(num_digits, 0);
+                }
+            }
+        }
+    }
+
+    fn trim_zeros(&mut self) {
+        let Self::MultiDigit(digits) = self else {
+            return;
+        };
+        while let Some(&0) = digits.last() {
+            digits.pop();
+        }
+    }
+
+    pub fn push_digit(&mut self, digit: u64) {
+        if digit == 0 {
+            return;
+        }
+        match self {
+            Self::TwoDigit([d @ 0, 0] | [_, d @ 0]) => *d = digit,
+            &mut Self::TwoDigit([d0, d1]) => {
+                let mut digits = Vec::with_capacity(4);
+                digits.extend_from_slice(&[d0, d1, digit]);
+                *self = Self::MultiDigit(digits);
+            }
+            Self::MultiDigit(digits) => {
+                debug_assert_ne!(digits.last(), Some(&0));
+                digits.push(digit);
+            }
+        }
+    }
+}
+
+macro_rules! impl_from_for_big_uint {
+    ($($ty:ty),+ $(,)?) => { $(
+        impl From<$ty> for BigUint {
+            fn from(value: $ty) -> Self {
+                Self::new(value as _)
+            }
+        }
+    )+ };
+}
+impl_from_for_big_uint!(bool, u8, u16, u32, u64);
+
+impl From<u128> for BigUint {
+    fn from(value: u128) -> Self {
+        BigUint::TwoDigit([value as _, (value >> 64) as _])
+    }
+}
+
+impl BigUint {
+    pub fn add_small(&mut self, mut rhs: u64) {
+        let digits = self.digits_mut();
+
+        for digit in digits {
+            let carry;
+            (*digit, carry) = digit.overflowing_add(rhs);
+            if !carry {
+                return;
+            }
+            rhs = 1;
+        }
+
+        if rhs != 0 {
+            self.push_digit(rhs);
+        }
+    }
+
+    pub fn sub_small(&mut self, mut rhs: u64) -> bool {
+        let digits = self.digits_mut();
+
+        for digit in digits {
+            let borrow;
+            (*digit, borrow) = digit.overflowing_sub(rhs);
+            if !borrow {
+                return false;
+            }
+            rhs = 1;
+        }
+
+        self.trim_zeros();
+
+        true
+    }
+
+    pub fn mul_small(&mut self, rhs: u64) {
+        let digits = self.digits_mut();
+
+        let mut carry = 0;
+        for digit in digits {
+            (*digit, carry) = digit.carrying_mul_ext(rhs, carry);
+        }
+
+        if carry != 0 {
+            self.push_digit(carry);
+        }
+    }
+
+    pub fn div_small(&mut self, rhs: u64) -> u64 {
+        let digits = self.digits_mut();
+
+        let mut carry = 0;
+        for digit in digits.iter_mut().rev() {
+            let total = (carry as u128) << 64 | *digit as u128;
+            *digit = (total / rhs as u128) as _;
+            carry = (total % rhs as u128) as _;
+        }
+
+        self.trim_zeros();
+
+        carry
+    }
+
+    pub fn add(&mut self, rhs: &Self) {
+        let rhs_digits = rhs.digits();
+        self.zero_extend(rhs_digits.len());
+        let my_digits = self.all_digits_mut();
+
+        assert!(rhs_digits.len() <= my_digits.len());
+
+        let mut carry = false;
+        let mut i = 0;
+        while let Some(&rhs_digit) = rhs_digits.get(i) {
+            (my_digits[i], carry) = my_digits[i].carrying_add_ext(rhs_digit, carry);
+            i += 1;
+        }
+
+        while carry {
+            if let Some(digit) = my_digits.get_mut(i) {
+                (*digit, carry) = digit.overflowing_add(1);
+                i += 1;
+            } else {
+                self.push_digit(1);
+                break;
+            }
+        }
+    }
+
+    pub fn sub(&mut self, rhs: &Self) -> bool {
+        let (my_digits, rhs_digits) = (self.digits_mut(), rhs.digits());
+
+        if my_digits.len() < rhs_digits.len() {
+            return true;
+        }
+
+        let mut borrow = false;
+        let mut i = 0;
+        while let Some(&rhs_digit) = rhs_digits.get(i) {
+            (my_digits[i], borrow) = my_digits[i].borrowing_sub_ext(rhs_digit, borrow);
+            i += 1;
+        }
+
+        while borrow {
+            if let Some(digit) = my_digits.get_mut(i) {
+                (*digit, borrow) = digit.overflowing_sub(1);
+                i += 1;
+            } else {
+                return true;
+            }
+        }
+        self.trim_zeros();
+        false
+    }
+    pub fn mul_inplace(&mut self, rhs: &Self) {
+        if let (&Self::TwoDigit([my_d0, my_d1]), &Self::TwoDigit([rhs_d0, rhs_d1])) = (&*self, rhs)
+        {
+            let (d0, d1) = my_d0.widening_mul_ext(rhs_d0);
+            let (d1, d2_1) = my_d0.carrying_mul_ext(rhs_d1, d1);
+            let (d1, d2_2) = my_d1.carrying_mul_ext(rhs_d0, d1);
+            let (d2, d3_1) = d2_1.overflowing_add(d2_2);
+            let (d2, d3_2) = my_d1.carrying_mul_ext(rhs_d1, d2);
+            let d3 = d3_1 as u64 + d3_2;
+            *self = match d2 == 0 && d3 == 0 {
+                true => Self::TwoDigit([d0, d1]),
+                false => Self::MultiDigit(vec![d0, d1, d2, d3]),
+            };
+            self.trim_zeros();
+            return;
+        }
+
+        let rhs_digits = rhs.digits();
+        let my_num_digits = self.num_digits();
+        self.zero_extend(my_num_digits + rhs_digits.len());
+        let my_digits = self.all_digits_mut();
+
+        for i in (0..my_num_digits).rev() {
+            let my_digit = my_digits[i];
+            my_digits[i] = 0;
+
+            let (mut carry, mut carry_bit) = (0, false);
+            for (j, &rhs_digit) in rhs_digits.iter().enumerate() {
+                let digit = &mut my_digits[i + j];
+                (*digit, carry_bit) = digit.carrying_add_ext(carry, carry_bit);
+                (*digit, carry) = my_digit.carrying_mul_ext(rhs_digit, *digit);
+            }
+            let mut j = i + rhs_digits.len();
+            (my_digits[j], carry_bit) = my_digits[j].carrying_add_ext(carry, carry_bit);
+            while carry_bit {
+                j += 1;
+                (my_digits[j], carry_bit) = my_digits[j].overflowing_add(carry_bit as _);
+            }
+        }
+
+        self.trim_zeros();
+    }
+    pub fn mul(&self, rhs: &Self) -> Self {
+        if let (&Self::TwoDigit([my_d0, my_d1]), &Self::TwoDigit([rhs_d0, rhs_d1])) = (self, rhs) {
+            let (d0, d1) = my_d0.widening_mul_ext(rhs_d0);
+            let (d1, d2_1) = my_d0.carrying_mul_ext(rhs_d1, d1);
+            let (d1, d2_2) = my_d1.carrying_mul_ext(rhs_d0, d1);
+            let (d2, d3_1) = d2_1.overflowing_add(d2_2);
+            let (d2, d3_2) = my_d1.carrying_mul_ext(rhs_d1, d2);
+            let d3 = d3_1 as u64 + d3_2;
+            let mut result = match d2 == 0 && d3 == 0 {
+                true => Self::TwoDigit([d0, d1]),
+                false => Self::MultiDigit(vec![d0, d1, d2, d3]),
+            };
+            result.trim_zeros();
+            return result;
+        }
+
+        let (my_digits, rhs_digits) = (self.digits(), rhs.digits());
+        let mut digits = vec![0u64; my_digits.len() + rhs_digits.len()];
+
+        for (i, &my_digit) in my_digits.iter().enumerate() {
+            let (mut carry, mut carry_bit) = (0, false);
+            for (j, &rhs_digit) in rhs_digits.iter().enumerate() {
+                let digit = &mut digits[i + j];
+                (*digit, carry_bit) = digit.carrying_add_ext(carry, carry_bit);
+                (*digit, carry) = my_digit.carrying_mul_ext(rhs_digit, *digit);
+            }
+            digits[i + rhs_digits.len()] = carry.checked_add(carry_bit as _).unwrap();
+        }
+
+        let mut result = Self::MultiDigit(digits);
+        result.trim_zeros();
+        result
+    }
+}
+
+impl PartialEq for BigUint {
+    fn eq(&self, other: &Self) -> bool {
+        self.digits() == other.digits()
+    }
+}
+impl Eq for BigUint {}
+impl PartialOrd for BigUint {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for BigUint {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        let (my_digits, other_digits) = (self.digits(), other.digits());
+        match my_digits.len().cmp(&other_digits.len()) {
+            cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        my_digits.iter().rev().cmp(other_digits.iter().rev())
+    }
+}
+
+impl fmt::Display for BigUint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+
+        if 16384 < self.bit_len() {
+            write!(f, "<uint with {} bits>", self.bit_len())?;
+            return Ok(());
+        } else if self.is_zero() {
+            f.write_char('0')?;
+            return Ok(());
+        }
+
+        let mut decimal_digits = String::with_capacity(self.bit_len());
+
+        let mut num = self.clone();
+
+        while num.is_nonzero() {
+            let start = decimal_digits.len();
+            write!(
+                decimal_digits,
+                "{:0>16}",
+                num.div_small(10_000_000_000_000_000),
+            )?;
+            unsafe { decimal_digits.as_bytes_mut()[start..].reverse() };
+        }
+
+        unsafe { decimal_digits.as_bytes_mut().reverse() };
+
+        f.write_str(decimal_digits.trim_start_matches('0'))
+    }
+}

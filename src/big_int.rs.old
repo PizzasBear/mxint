@@ -1,0 +1,183 @@
+use std::{cmp::Ordering, fmt, u64};
+
+use crate::U64Ext;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct BigInt {
+    digits: Vec<u64>,
+}
+
+impl BigInt {
+    const ZERO: Self = Self { digits: Vec::new() };
+    pub fn zero() -> Self {
+        Self::ZERO
+    }
+    pub fn from_i64(value: i64) -> Self {
+        let mut slf = Self {
+            digits: vec![value.unsigned_abs()],
+        };
+        slf.trim_sign(value.is_negative());
+        slf
+    }
+    pub fn from_u64(value: u64) -> Self {
+        let mut slf = Self {
+            digits: vec![value],
+        };
+        slf.trim_sign(false);
+        slf
+    }
+    pub fn with_capacity(num_digits: usize) -> Self {
+        Self {
+            digits: Vec::with_capacity(num_digits),
+        }
+    }
+    pub fn is_zero(&self) -> bool {
+        self.digits.is_empty()
+    }
+    pub fn is_negative(&self) -> bool {
+        self.digits.last().is_some_and(|&digit| digit >> 63 != 0)
+    }
+    fn sign_extend(&mut self, num_digits: usize) {
+        self.digits.resize(
+            self.digits.len().max(num_digits),
+            (self.is_negative() as u64).wrapping_neg(),
+        );
+    }
+    fn trim_sign(&mut self, is_negative: bool) {
+        let sx_digit = (is_negative as u64).wrapping_neg();
+        while self.digits.last().is_some_and(|&digit| digit == sx_digit) {
+            self.digits.pop();
+        }
+        if self.is_negative() != is_negative {
+            self.digits.push(sx_digit);
+        }
+    }
+    pub fn neg_inplace(&mut self) {
+        let was_neg = self.is_negative();
+
+        let mut borrow = false;
+        for digit in &mut self.digits {
+            (*digit, borrow) = 0u64.borrowing_sub_ext(*digit, borrow);
+        }
+        self.trim_sign(!was_neg);
+    }
+    pub fn neg(&self) -> Self {
+        let mut neg = self.clone();
+        neg.neg_inplace();
+        neg
+    }
+    pub fn add_inplace(&mut self, other: &Self) {
+        let was_neg = self.is_negative();
+        self.sign_extend(other.digits.len());
+        let (lhs, rhs) = (&mut self.digits, other.digits.as_slice());
+
+        let mut carry = false;
+        for (lhs_digit, &rhs_digit) in lhs.iter_mut().zip(rhs) {
+            (*lhs_digit, carry) = lhs_digit.carrying_add_ext(rhs_digit, carry);
+        }
+        if !other.is_negative() {
+            for digit in lhs.get_mut(rhs.len()..).unwrap_or_default() {
+                if !carry {
+                    break;
+                }
+                (*digit, carry) = digit.overflowing_add(1);
+            }
+        }
+        match (was_neg, other.is_negative()) {
+            (false, false) => match carry {
+                true => self.digits.push(1),
+                false => self.trim_sign(false),
+            },
+            (true, true) => {
+                debug_assert!(carry);
+                self.trim_sign(true);
+            }
+            _ => self.trim_sign(!carry),
+        }
+    }
+    pub fn sub_inplace(&mut self, other: &Self) {
+        let was_neg = self.is_negative();
+        self.sign_extend(other.digits.len());
+        let (lhs, rhs) = (&mut self.digits, other.digits.as_slice());
+
+        let mut borrow = false;
+        for (lhs_digit, &rhs_digit) in lhs.iter_mut().zip(rhs) {
+            (*lhs_digit, borrow) = lhs_digit.borrowing_sub_ext(rhs_digit, borrow);
+        }
+        for digit in lhs.get_mut(rhs.len()..).unwrap_or_default() {
+            if !borrow {
+                break;
+            }
+            (*digit, borrow) = digit.overflowing_sub(1);
+        }
+        match (was_neg, other.is_negative()) {
+            (false, true) => {
+                debug_assert!(borrow);
+                self.trim_sign(false);
+            }
+            (true, false) => match borrow {
+                true => self.digits.push(u64::MAX - 1),
+                false => self.trim_sign(true),
+            },
+            _ => self.trim_sign(borrow),
+        }
+    }
+    pub fn add(&self, other: &Self) -> Self {
+        let mut sum = Self::with_capacity(self.digits.len().max(other.digits.len()) + 1);
+        sum.digits.extend_from_slice(&self.digits);
+        sum.add_inplace(other);
+        sum
+    }
+    pub fn sub(&self, other: &Self) -> Self {
+        let mut diff = Self::with_capacity(self.digits.len().max(other.digits.len()) + 1);
+        diff.digits.extend_from_slice(&self.digits);
+        diff.sub_inplace(other);
+        diff
+    }
+
+    pub fn mul() {
+        todo!()
+    }
+}
+
+impl PartialOrd for BigInt {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for BigInt {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let is_negative = self.is_negative();
+        (is_negative.cmp(&other.is_negative()).reverse()).then_with(|| {
+            let mut len_ord = self.digits.len().cmp(&other.digits.len());
+            if is_negative {
+                len_ord = len_ord.reverse();
+            }
+            len_ord.then_with(|| self.digits.iter().rev().cmp(other.digits.iter().rev()))
+        })
+    }
+}
+
+impl fmt::LowerHex for BigInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use fmt::Write;
+
+        let neg;
+        let digits = if self.is_negative() {
+            f.write_char('-')?;
+            neg = self.neg();
+            neg.digits.as_slice()
+        } else {
+            if f.sign_plus() {
+                f.write_char('+')?;
+            }
+            self.digits.as_slice()
+        };
+        write!(f, "0x{:x}", self.digits.last().unwrap_or(&0))?;
+        for &digit in digits.iter().rev().skip(1) {
+            write!(f, "_{digit:0>16x}")?;
+        }
+
+        Ok(())
+    }
+}
